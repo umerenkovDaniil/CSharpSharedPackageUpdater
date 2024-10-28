@@ -1,0 +1,28 @@
+﻿<Project>
+	<PropertyGroup>
+		<DebugType>embedded</DebugType>
+	</PropertyGroup>
+	<PropertyGroup>
+		<SolutionDir>$(MSBuildThisFileDirectory)</SolutionDir>
+	</PropertyGroup>
+	<PropertyGroup>
+		<CodeAnalysisRuleSet>$(SolutionDir)stylecop.ruleset</CodeAnalysisRuleSet>
+	</PropertyGroup>
+	<ItemGroup>
+		<PackageReference Include="StyleCop.Analyzers" Version="1.1.118" />
+		<PackageReference Include="SonarAnalyzer.CSharp" Version="9.32.0.97167" />
+		<PackageReference Include="Microsoft.CodeAnalysis.CSharp" Version="4.11.0" />
+		<AdditionalFiles Include="$(SolutionDir)stylecop.ruleset" Link="stylecop.ruleset" />
+		<AdditionalFiles Include="$(SolutionDir)stylecop.json" Link="stylecop.json" />
+	</ItemGroup>
+	<ItemGroup Condition="$(MSBuildProjectName.StartsWith('Tests.'))">
+		<PackageReference Include="TeamCity.VSTest.TestAdapter" Version="1.0.41" />		
+		<PackageReference Include="JunitXml.TestLogger" Version="4.1.0" />
+	</ItemGroup>
+	<PropertyGroup Condition="$(MSBuildProjectName.StartsWith('Tests.'))">
+		<CollectCoverage>true</CollectCoverage>
+		<CoverletOutputFormat>opencover</CoverletOutputFormat>
+		<CoverletOutput>bin/Coverage/lcov</CoverletOutput>
+		<VSTestResultsDirectory>$(SolutionDir)</VSTestResultsDirectory>
+	</PropertyGroup>
+</Project>
