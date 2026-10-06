@@ -5,11 +5,13 @@ using System.Data;
 using System.Diagnostics;
 using System.IO;
 using System.Linq;
+using System.Security.Cryptography;
 using System.Text;
 using System.Threading;
 using System.Threading.Tasks;
 using System.Xml;
 using System.Xml.Linq;
+using System.Xml.XPath;
 using CSharpSharedPackageUpdater.Exceptions;
 using CSharpSharedPackageUpdater.Extensions;
 using CSharpSharedPackageUpdater.Interfaces;
@@ -34,6 +36,7 @@ namespace CSharpSharedPackageUpdater
 		private const string PROPS = "Directory.Build.props";
 		private const int NUGET_MAX_PAGE_SIZE = 1000;
 		private const int NUGET_MAX_SKIP = 3000;
+		private const string PACKAGE_ITEM_GROUP = "//Project/ItemGroup";
 
 		public string? ReposDir { get; set; }
 		public SharedPackage[] Shared { get; set; }
@@ -50,8 +53,19 @@ namespace CSharpSharedPackageUpdater
 		public string TargetFramework { get; set; } = $"net{Environment.Version.Major}.{Environment.Version.Minor}";
 		public Signature? Sig { get; set; }
 		public string CommitMessage { get; set; } = "autoupdate packages";
+		public Dictionary<string, string> PropsEnsure { get; set; }
+		public Dictionary<Predicate<string>, string[]> PackagesEnsure { get; set; }
+		public Dictionary<Predicate<string>, string[]> PackagesDelete { get; set; }
 
+		public string[] FileSync
+		{
+			get => [.._fileHashes.Keys];
+			set => CalcFileHashes(value);
+		}
+
+		private readonly Dictionary<string, string> _fileHashes;
 		private readonly ConcurrentDictionary<string, Repository> _repos;
+
 		private NugetLogWrapper? _nugetLogger;
 
 		private bool _disposed;
@@ -68,6 +82,8 @@ namespace CSharpSharedPackageUpdater
 		public PackageUpdater()
 		{
 			_repos = new ConcurrentDictionary<string, Repository>();
+			_fileHashes = new();
+
 			Shared = [];
 			Logger = NullLogger.Instance;
 			NugetPackages = [];
@@ -75,6 +91,8 @@ namespace CSharpSharedPackageUpdater
 			DirtyFilesSkip = [];
 			ObsoleteWarnings = [];
 			VulnerabilityWarnings = [];
+			FileSync = [];
+			PropsEnsure = new();
 		}
 
 		/// <summary>
@@ -84,7 +102,7 @@ namespace CSharpSharedPackageUpdater
 		public async Task FullAsync()
 		{
 			var all = FindExistingRepos();
-			await SetBranchAsync(all, Branch);
+			// await SetBranchAsync(all, Branch);
 
 			var packages = await GetPackagesAsync();
 			await UpdateReposAsync(all, packages);
@@ -116,8 +134,15 @@ namespace CSharpSharedPackageUpdater
 
 			await repos.ForEachAsync(async r =>
 			{
-				var dirty = await CheckAndPullAsync(r, branch);
-				if (dirty) exceptions.Add(new InvalidOperationException($"{Path.GetFileName(r)} dirty"));
+				try
+				{
+					var dirty = await CheckAndPullAsync(r, branch);
+					if (dirty) exceptions.Add(new InvalidOperationException($"{Path.GetFileName(r)} dirty"));
+				}
+				catch (Exception e)
+				{
+					exceptions.Add(new InvalidOperationException($"{Path.GetFileName(r)} error: {e.Message}"));
+				}
 			});
 
 			if (exceptions.Count != 0) throw new AggregateException(exceptions);
@@ -142,7 +167,7 @@ namespace CSharpSharedPackageUpdater
 			using var cts = CancellationTokenSource.CreateLinkedTokenSource(token);
 
 			var ct = cts.Token;
-			var allUpdates = new ConcurrentDictionary<string, ConcurrentBag<(string, IUpdatable[])>>();
+			var allUpdates = new ConcurrentDictionary<string, ConcurrentBag<(string, IOp[])>>();
 			var exceptions = new ConcurrentBag<Exception>();
 
 			await repos.ForEachAsync(
@@ -172,6 +197,42 @@ namespace CSharpSharedPackageUpdater
 						}
 					}
 
+					foreach (var (key, hash) in _fileHashes)
+					{
+						var copy = false;
+						var exists = false;
+						var fileName = Path.GetFileName(key);
+						var filePath = Path.Combine(dir, fileName);
+
+						try
+						{
+							await using var readStream = File.OpenRead(filePath);
+							var eHash = await MD5.HashDataAsync(readStream, ct);
+
+							if (hash != Convert.ToHexString(eHash)) copy = true;
+							exists = true;
+						}
+						catch (FileNotFoundException)
+						{
+							copy = true;
+						}
+
+						if (copy)
+						{
+							Logger.LogDebug("{FileName}", fileName);
+							var f = new FileOp(filePath, key, exists);
+
+							allUpdates.AddOrUpdate(
+								dir,
+								_ => [(fileName, [f])],
+								(_, l) =>
+								{
+									l.Add((fileName, [f]));
+									return l;
+								});
+						}
+					}
+
 					foreach (var file in Directory.GetFiles(dir, "*.csproj", SearchOption.AllDirectories))
 					{
 						await using var fs = File.OpenRead(file);
@@ -179,23 +240,42 @@ namespace CSharpSharedPackageUpdater
 						if (proj.Root == null) throw new XmlException(file);
 
 						var fileName = new DirectoryInfo(file).Name;
-						var localMismatches = new List<IUpdatable>();
+						var localMismatches = new List<IOp>();
 
 						// framework check
 						var frameworks = proj.Root.Descendants("TargetFramework").ToArray();
 						if (frameworks.Length != 1) throw new InvalidOperationException($"{fileName} invalid num of frameworks");
 
-						var fr = new Framework(frameworks[0].Value, file, proj, frameworks[0], TargetFramework);
-						if (!TargetFramework.Equals(fr.Value, StringComparison.InvariantCultureIgnoreCase))
+						var fr = new XmlValueOp(file, proj, frameworks[0], TargetFramework);
+						if (!TargetFramework.Equals(frameworks[0].Value, StringComparison.InvariantCultureIgnoreCase))
 						{
 							Logger.LogDebug("{Fr}", fr);
 							localMismatches.Add(fr);
 						}
 
+						var toDelete = PackagesDelete
+							.Where(x => x.Key(file))
+							.SelectMany(x => x.Value)
+							.Distinct()
+							.ToDictionary(x => x, x => packages[x]);
+
+						var toEnsure = PackagesEnsure
+							.Where(x => x.Key(file))
+							.SelectMany(x => x.Value)
+							.Distinct()
+							.ToDictionary(x => x, x => packages[x]);
+
 						// versions check
 						foreach (var (n, v, node) in AllDependencies(proj, file))
 						{
 							if (!packages.TryGetValue(n, out var p)) continue;
+							if (toDelete.ContainsKey(n))
+							{
+								localMismatches.Add(new XmlDeleteOp(file, proj, node));
+								continue;
+							}
+
+							toEnsure.Remove(n);
 
 							if (v > p.Version)
 							{
@@ -208,9 +288,30 @@ namespace CSharpSharedPackageUpdater
 
 							if (v != p.Version)
 							{
-								var m = new Mismatch(n, file, v, p, node, proj);
+								var m = new XmlAttributeOp(file, proj, node, "Version", p.Version);
 								Logger.LogDebug("{M}", m);
 								localMismatches.Add(m);
+							}
+						}
+
+						var pig = proj.XPathSelectElement(PACKAGE_ITEM_GROUP);
+						if (pig != null)
+						{
+							foreach (var (name, p) in toEnsure)
+							{
+								var op = new XmlNewOp(
+									file,
+									proj,
+									pig,
+									"PackageReference",
+									null,
+									new()
+									{
+										{ "Include", name },
+										{ "Version", p.Version },
+									});
+
+								localMismatches.Add(op);
 							}
 						}
 
@@ -229,7 +330,8 @@ namespace CSharpSharedPackageUpdater
 						}
 					}
 				},
-				token: ct);
+				token: ct,
+				maxDegreeOfParallelism: 1);
 
 			if (exceptions.Count != 0) throw new AggregateException(exceptions);
 
@@ -282,7 +384,8 @@ namespace CSharpSharedPackageUpdater
 
 						await PushUpvAsync(p.Key);
 					},
-					token: ct);
+					token: ct,
+					maxDegreeOfParallelism: 1);
 			}
 		}
 
@@ -506,7 +609,7 @@ namespace CSharpSharedPackageUpdater
 
 			cts.Token.ThrowIfCancellationRequested();
 
-			var propsMismatches = new ConcurrentDictionary<SharedPackage, IUpdatable[]>();
+			var propsMismatches = new ConcurrentDictionary<SharedPackage, IOp[]>();
 			var exceptions = new ConcurrentBag<Exception>();
 
 			// check local build.props
@@ -598,8 +701,8 @@ namespace CSharpSharedPackageUpdater
 
 			if (exceptions.Count != 0) throw new AggregateException(exceptions);
 
-			var mismatches = new Dictionary<LocalNugetPackage, IUpdatable[]>();
-			var mBuffer = new List<IUpdatable>();
+			var mismatches = new Dictionary<LocalNugetPackage, IOp[]>();
+			var mBuffer = new List<IOp>();
 
 			// mismatches with the external nugets
 			foreach (var (_, proj) in localProj)
@@ -608,7 +711,7 @@ namespace CSharpSharedPackageUpdater
 				{
 					if (target.Version != v)
 					{
-						var m = new Mismatch(n, proj.ProjPath, v, target, node, proj.Xml);
+						var m = new XmlAttributeOp(proj.ProjPath, proj.Xml, node, "Version", target.Version);
 						Logger.LogDebug("{M}", m);
 
 						mBuffer.Add(m);
@@ -653,38 +756,17 @@ namespace CSharpSharedPackageUpdater
 		/// <param name="updates">Updates.</param>
 		/// <param name="token">Cancellation token.</param>
 		/// <returns>Task.</returns>
-		public async Task ResolveUpdatesAsync(IUpdatable[] updates, CancellationToken token = default)
+		public async Task ResolveUpdatesAsync(IOp[] updates, CancellationToken token = default)
 		{
 			if (updates.Length == 0) return;
 
 			foreach (var u in updates)
 			{
-				u.Fix();
-				u.Resolved = true;
+				await u.FixAsync(token);
 				Logger.LogDebug("{U} resolved", u);
 			}
 
-			await using var fs = File.OpenWrite(updates[0].Path);
-
-			// unset current content
-			fs.SetLength(0);
-
-			await fs.FlushAsync(token);
-			fs.Seek(0, SeekOrigin.Begin);
-
-			await using var xw = XmlWriter.Create(
-				fs,
-				new XmlWriterSettings
-				{
-					Indent = true,
-					IndentChars = "\t",
-					Async = true,
-					CloseOutput = true,
-					OmitXmlDeclaration = true,
-					Encoding = Encoding.UTF8
-				});
-
-			await updates[0].Xml.SaveAsync(xw, token);
+			await updates[0].SaveAsync(token);
 			Logger.LogDebug("{Path} resolved", updates[0].Path);
 		}
 
@@ -724,7 +806,7 @@ namespace CSharpSharedPackageUpdater
 		/// <returns>Versions exceptions and needed updates.</returns>
 		/// <exception cref="DirectoryNotFoundException">Sln dir not found.</exception>
 		/// <exception cref="XmlException">Props xml invalid.</exception>
-		public async Task<(Exception[], IUpdatable[])> CheckPropsAsync(string dir, IDictionary<string, NugetPackage> packages, CancellationToken token = default)
+		public async Task<(Exception[], IOp[])> CheckPropsAsync(string dir, IDictionary<string, NugetPackage> packages, CancellationToken token = default)
 		{
 			if (!Directory.Exists(dir)) throw new DirectoryNotFoundException(dir);
 
@@ -737,7 +819,7 @@ namespace CSharpSharedPackageUpdater
 			token.ThrowIfCancellationRequested();
 			if (proj.Root == null) throw new XmlException(props);
 
-			var result = new List<IUpdatable>();
+			var result = new List<IOp>();
 			var exceptions = new List<Exception>();
 
 			foreach (var (n, v, node) in AllDependencies(proj, props))
@@ -763,9 +845,34 @@ namespace CSharpSharedPackageUpdater
 
 				if (v < package!.Version)
 				{
-					var m = new Mismatch(n, props, v, package, node, proj);
+					var m = new XmlAttributeOp(props, proj, node, "Version", package.Version);
 					Logger.LogDebug("{M}", m);
 					result.Add(m);
+				}
+			}
+
+			foreach (var (path, val) in PropsEnsure)
+			{
+				var el = proj.XPathSelectElement(path);
+				IOp? op = null;
+
+				if (el == null)
+				{
+					var split = path.Split('/', StringSplitOptions.RemoveEmptyEntries);
+					var parent = proj.XPathSelectElement(string.Join('/', split[..^1]));
+					if (parent != null)
+					{
+						op = new XmlNewOp(props, proj, parent, split[^1], val);
+					}
+				}
+				else if (el.Value != val)
+				{
+					op = new XmlValueOp(props, proj, el, val);
+				}
+
+				if (op != null)
+				{
+					result.Add(op);
 				}
 			}
 
@@ -869,6 +976,21 @@ namespace CSharpSharedPackageUpdater
 			}
 
 			return repo;
+		}
+
+		private void CalcFileHashes(string[] files)
+		{
+			_fileHashes.Clear();
+
+			foreach (var file in files)
+			{
+				if (Path.GetFileName(file).ToLower() == ".ds_store") continue;
+
+				using var readStream = File.OpenRead(file);
+				var hash = MD5.HashData(readStream);
+
+				_fileHashes[file] = Convert.ToHexString(hash);
+			}
 		}
 
 		private static IEnumerable<Dependency> AllDependencies(XDocument el, string @ref)
